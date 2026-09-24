@@ -33,6 +33,26 @@ impl Toolchain {
     }
 }
 
+/// 起 ffmpeg / ffprobe 子进程统一走这里。
+///
+/// Windows 上必须加 `CREATE_NO_WINDOW`：release 的 `vzip-gui` 是 GUI 子系统进程
+/// （`windows_subsystem = "windows"`），它起控制台程序时 Windows 会**给子进程单开一个
+/// 控制台窗口**——就是用户看到的那个标题为 ffmpeg.exe 路径的黑窗。子进程的 stdio
+/// 全部走管道，根本不需要控制台。
+pub(crate) fn command(program: &Path) -> Command {
+    let cmd = Command::new(program);
+    // Windows 上才需要改，别的平台原样返回（`mut` 只在 cfg 里用，所以用 shadow 而不是 `let mut`）
+    #[cfg(windows)]
+    let cmd = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = cmd;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    };
+    cmd
+}
+
 /// 定位 ffmpeg / ffprobe。
 /// 顺序：显式指定 > 环境变量 > exe 同目录（分发包自带的）> PATH
 ///
@@ -113,7 +133,7 @@ fn sibling(beside: &Path, name: &str) -> Option<PathBuf> {
 
 /// "ffmpeg version 5.1.9-0+deb12u1 Copyright ..." 或 "ffmpeg version n4.4.1"
 fn version_of(ffmpeg: &Path) -> Result<(u32, u32)> {
-    let out = Command::new(ffmpeg).arg("-version").output()?;
+    let out = command(ffmpeg).arg("-version").output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next().unwrap_or("");
     let token = first
@@ -128,7 +148,7 @@ fn version_of(ffmpeg: &Path) -> Result<(u32, u32)> {
 }
 
 fn encoders_of(ffmpeg: &Path) -> Result<HashSet<String>> {
-    let out = Command::new(ffmpeg)
+    let out = command(ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()?;
     let text = String::from_utf8_lossy(&out.stdout);

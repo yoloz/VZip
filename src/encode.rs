@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,6 +135,13 @@ pub fn encode(
         OsString::from(input),
         OsString::from("-vf"),
         OsString::from(&filter),
+        // 必须和 pass 2 用同一个像素格式：10 bit 源（手机拍的 HDR，HEVC Main 10）
+        // 不指定的话 pass 1 就按 10 bit 跑，stats 记 bitdepth=10，pass 2 的
+        // `-pix_fmt yuv420p` 会让 libx264 直接拒绝打开编码器（different bitdepth
+        // setting than first pass），一帧都进不了 mp4，报错只剩 muxer 那句
+        // `Nothing was written into output file…`
+        OsString::from("-pix_fmt"),
+        OsString::from("yuv420p"),
         OsString::from("-an"),
         OsString::from("-c:v"),
         OsString::from(encoder),
@@ -216,7 +223,7 @@ fn run(
     lo: f64,
     hi: f64,
 ) -> Result<()> {
-    let mut child = Command::new(&tc.ffmpeg)
+    let mut child = crate::resolve::command(&tc.ffmpeg)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -263,10 +270,77 @@ fn run(
         bail!("已取消");
     }
     if !status.success() {
+        // ffmpeg 的报错常常是"前因 + 收尾总结"两段，只留最后一行等于把前因丢了
+        // （`Nothing was written into output file…` 就是典型的收尾总结，光看它无从下手）。
+        // 给用户看尾部若干行；完整 stderr 和实际命令行落到日志里。
+        log::error!(
+            "ffmpeg 失败（{status}）\n  命令：{}\n  stderr：\n{err}",
+            command_line(&tc.ffmpeg, args)
+        );
         bail!(
-            "ffmpeg 执行失败：{}",
-            err.lines().last().unwrap_or("未知错误").trim()
+            "ffmpeg 执行失败（{status}）：\n{}",
+            tail_lines(&err, ERROR_TAIL_LINES)
         );
     }
     Ok(())
+}
+
+/// 给用户看的 stderr 尾部行数：够看到前因，又不至于把弹窗撑爆
+const ERROR_TAIL_LINES: usize = 15;
+
+/// 实际执行了什么命令——排查时必须有（少了它连 scale、码率都无从对证）
+fn command_line(program: &Path, args: &[OsString]) -> String {
+    let mut line = program.display().to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(&arg.to_string_lossy());
+    }
+    line
+}
+
+/// stderr 的最后 `n` 行（跳过空行），全空则给个明确的占位
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return "（ffmpeg 没有输出任何错误信息）".to_string();
+    }
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 报错信息不能再只留最后一行：前因（前面的行）比收尾总结重要。
+    /// 之前 `ffmpeg 执行失败：Nothing was written into output file…` 就是这么来的。
+    #[test]
+    fn error_tail_keeps_the_cause_lines() {
+        let stderr = "  前因：某处出错了  \n\n收尾总结\n";
+        assert_eq!(tail_lines(stderr, 15), "  前因：某处出错了  \n收尾总结");
+        assert_eq!(tail_lines(stderr, 1), "收尾总结");
+    }
+
+    #[test]
+    fn empty_stderr_says_so() {
+        assert_eq!(tail_lines("", 15), "（ffmpeg 没有输出任何错误信息）");
+        assert_eq!(
+            tail_lines(" \n\n\t\n", 15),
+            "（ffmpeg 没有输出任何错误信息）"
+        );
+    }
+
+    /// 命令行要带上程序路径和每个参数，且有空格/中文的路径也不能丢
+    #[test]
+    fn command_line_includes_program_and_args() {
+        let args = vec![
+            OsString::from("-i"),
+            OsString::from("/tmp/我的 视频.MOV"),
+            OsString::from("-b:v"),
+            OsString::from("195k"),
+        ];
+        assert_eq!(
+            command_line(Path::new("/tmp/bundled/ffmpeg"), &args),
+            "/tmp/bundled/ffmpeg -i /tmp/我的 视频.MOV -b:v 195k"
+        );
+    }
 }
