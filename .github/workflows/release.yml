@@ -1,0 +1,146 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ffmpeg-static 的版本标签：ffmpeg / ffprobe 6.1.1，四平台齐全
+  FFMPEG_TAG: b6.1.1
+  BASE_URL: https://github.com/eugeneware/ffmpeg-static/releases/download
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ffmpeg_asset: ffmpeg-linux-x64
+            ffprobe_asset: ffprobe-linux-x64
+            pkg: vzip-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            ffmpeg_asset: ffmpeg-win32-x64
+            ffprobe_asset: ffprobe-win32-x64
+            pkg: vzip-windows-x64
+          - os: macos-15 # Apple Silicon
+            target: aarch64-apple-darwin
+            ffmpeg_asset: ffmpeg-darwin-arm64
+            ffprobe_asset: ffprobe-darwin-arm64
+            pkg: vzip-macos-arm64
+          - os: macos-15-intel # Intel（macos-13 已于 2025-12 退役）
+            target: x86_64-apple-darwin
+            ffmpeg_asset: ffmpeg-darwin-x64
+            ffprobe_asset: ffprobe-darwin-x64
+            pkg: vzip-macos-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # winit 的 wayland 后端走 client_system，构建时要 libwayland（只装 xkbcommon 不够）
+      - name: Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev
+
+      - name: 编译
+        run: cargo build --release --bins --target ${{ matrix.target }}
+
+      - name: 下载 ffmpeg / ffprobe
+        shell: bash
+        run: |
+          mkdir -p dist
+          curl -fL --retry 3 --retry-delay 2 \
+            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffmpeg_asset }}" -o dist/ffmpeg
+          curl -fL --retry 3 --retry-delay 2 \
+            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffprobe_asset }}" -o dist/ffprobe
+
+      - name: 归置产物
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/vzip${{ matrix.ext }}"     dist/
+          cp "target/${{ matrix.target }}/release/vzip-gui${{ matrix.ext }}" dist/
+          mv dist/ffmpeg  "dist/ffmpeg${{ matrix.ext }}"
+          mv dist/ffprobe "dist/ffprobe${{ matrix.ext }}"
+          chmod +x dist/*
+          cp NOTICE.txt dist/
+
+      # arm64 的二进制必须签名才能执行，所以签名要在冒烟测试之前
+      - name: macOS 签名
+        if: runner.os == 'macOS'
+        run: |
+          xattr -cr dist
+          for f in ffmpeg ffprobe vzip vzip-gui; do
+            codesign --force -s - "dist/$f"
+            codesign --verify --strict "dist/$f"
+          done
+
+      # 注意别把 ffmpeg 接到 `| grep -q` 上：github 的 shell 带 pipefail，
+      # grep 命中即退出会让 ffmpeg 吃 SIGPIPE(141)，管道整体判定失败
+      - name: 校验自带的 ffmpeg 能跑
+        shell: bash
+        run: |
+          ./dist/ffmpeg${{ matrix.ext }} -version
+          ./dist/ffprobe${{ matrix.ext }} -version
+          ./dist/ffmpeg${{ matrix.ext }} -hide_banner -encoders > encoders.txt
+          if ! grep -q libx264 encoders.txt; then
+            echo "::error::自带的 ffmpeg 没有 libx264，压不了（上游资源变了？）"
+            exit 1
+          fi
+
+      # 真拿包里的二进制压一段：能挡住“能编译但跑不起来”的分发包（缺 dylib、签名、路径）
+      - name: 冒烟测试
+        shell: bash
+        run: |
+          mkdir -p smoke
+          ./dist/ffmpeg${{ matrix.ext }} -hide_banner -loglevel error \
+            -f lavfi -i testsrc=size=640x360:rate=30 \
+            -f lavfi -i sine=frequency=440 \
+            -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest smoke/in.mp4
+          ./dist/vzip${{ matrix.ext }} smoke/in.mp4 --max-size 300KB
+          size=$(wc -c < smoke/in_vzip.mp4)
+          limit=322560 # 300KB × 1.05
+          echo "输出 ${size} 字节，上限 ${limit} 字节"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::冒烟测试超出目标体积"
+            exit 1
+          fi
+
+      - name: 打包（tar.gz）
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.pkg }}.tar.gz -C dist .
+
+      - name: 打包（zip）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath ${{ matrix.pkg }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: ${{ matrix.pkg }}.*
+
+      - name: 上传 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.pkg }}.*
+          generate_release_notes: true

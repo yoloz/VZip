@@ -1,0 +1,15 @@
+VZip 分发包里的第三方组件
+==========================
+
+ffmpeg / ffprobe（可执行文件，未做任何修改）
+  来源：https://github.com/eugeneware/ffmpeg-static
+  标签：b6.1.1（ffmpeg 6.1.1）
+  许可：GPL（该构建静态链接了 libx264 等 GPL 组件）
+
+  许可全文与对应源码：
+    https://ffmpeg.org/legal.html
+    https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1
+
+  VZip 只在子进程里调用 ffmpeg，不链接、不修改它的代码。但把含 GPL 组件的
+  ffmpeg 与 VZip 打包在一起分发，整包要承担的法律义务（尤其商用、上架应用
+  商店的场景）请自行评估——这里不是法律意见。

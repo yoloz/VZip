@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main] # 两个名字都认，改名 / 换默认分支都不影响
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: 检查（fmt / clippy / 测试）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # winit 的 wayland 后端走 client_system，构建时要 libwayland（只装 xkbcommon 不够）
+      - name: Linux 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --all-targets
+
+      - name: 集成测试（用系统 ffmpeg 真压一段）
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p smoke
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i testsrc=size=640x360:rate=30 \
+            -f lavfi -i sine=frequency=440 \
+            -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest smoke/in.mp4
+          cargo build --release --bin vzip
+          ./target/release/vzip smoke/in.mp4 --max-size 300KB
+          test -s smoke/in_vzip.mp4
+
+  # 三平台各编译一遍：别等打了 tag 才发现某个平台编不过
+  build:
+    name: 编译 ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev
+
+      - name: 编译（含链接，能挡住缺库 / 缺符号）
+        run: cargo build --bins
