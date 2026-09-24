@@ -21,8 +21,16 @@ VZip：给小孩朗读视频打卡用的视频压缩工具。手机拍的朗读�
 - GUI 的启动失败**必须看得见**：eframe 把错误只写进 `log::error!`
   （`eframe/src/native/run.rs`），没装 logger 就等于静默退出，双击的用户只看到
   "一闪而过"。所以 `vzip-gui` 自己装 logger 写到 exe 同目录 `vzip-gui.log`
-  （`VZIP_LOG=info|trace|off` 调级别，默认 debug），失败再弹 `rfd` 消息框；
+  （`VZIP_LOG=debug|trace|off` 调级别，默认 **info**：debug 会被 wgpu / naga 灌几千行，
+  所以关键结论——启动参数、后端候选、失败原因——必须我们自己在 info 上记，
+  别指望默认级别下有 wgpu 的调试输出），失败再弹 `rfd` 消息框；
   release 版还带 `windows_subsystem = "windows"`，双击不再弹黑窗。别删这段
+- **Windows 上默认不给 Vulkan**：有些 Intel 驱动（实测 31.0.101.2141）在
+  `vkCreateDevice` 里直接崩进程，wgpu 连错误都返回不了——日志停在
+  `Supported extensions:` 就断，**没有 `ERROR` 行**（别去代码里找错误处理）。
+  所以 Windows 的默认候选后端是 DX12 + GL（`preferred_backends`；wgpu 只是在这两个
+  里挑最好的显卡，后端崩了不会自动换，所以别再往里加可疑后端）；
+  其他平台不覆盖 wgpu 默认；要强制 Vulkan 仍可 `set WGPU_BACKEND=vulkan`。别删这段
 - 若将来要在界面里内嵌播放视频 → 换 Tauri 2（egui 做不到）
 - ffmpeg 查找顺序：`--ffmpeg` > `VZIP_FFMPEG` > **exe 同目录（分发自带）** > PATH。
   自带必须优先，否则分发包会被系统旧 ffmpeg 顶掉再卡版本检查

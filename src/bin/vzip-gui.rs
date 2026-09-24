@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use eframe::wgpu;
 use vzip::encode::{FlagSink, Progress};
 use vzip::plan::{plan, Settings};
 use vzip::probe::{probe, MediaInfo};
@@ -442,7 +443,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
-            ui.heading("VZip · 朗读视频压缩");
+            ui.heading("VZip · 视频压缩");
             ui.separator();
             ui.add_space(8.0);
 
@@ -564,13 +565,16 @@ fn open_log_file() -> Option<(PathBuf, File)> {
         .find_map(|path| File::create(&path).ok().map(|file| (path, file)))
 }
 
-/// 级别用 `VZIP_LOG` 覆盖（`info` / `trace` / `off`…），默认 debug：
-/// 启动阶段就这么点输出，写全一点才够排查。
+/// 级别用 `VZIP_LOG` 覆盖（`info` / `debug` / `trace` / `off`…），默认 info。
+///
+/// 默认不挂 debug：wgpu / naga 的调试输出动辄几千行（每次启动都写文件），
+/// 真出问题的关键结论我们自己用 info 记（启动参数、后端候选、失败原因）。
+/// 要追 wgpu 内部的细节，`set VZIP_LOG=debug`（或 `trace`）再跑一次。
 fn init_logging() -> Option<PathBuf> {
     let level = std::env::var("VZIP_LOG")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(log::LevelFilter::Debug);
+        .unwrap_or(log::LevelFilter::Info);
 
     let opened = open_log_file();
     let path = opened.as_ref().map(|(path, _)| path.clone());
@@ -610,13 +614,49 @@ fn main() {
     }
 }
 
+/// Windows 上交给 wgpu 的候选后端；其他平台返回 `None`，即不覆盖 wgpu 自己的默认
+/// （`PRIMARY | GL`，macOS 照旧走 Metal）。
+///
+/// 为什么 Windows 上排掉 Vulkan：有些 Intel 显卡驱动（实测 31.0.101.2141）在
+/// `vkCreateDevice` 里直接崩进程，wgpu 连错误都返回不了——日志停在
+/// `Supported extensions:` 就断了，用户看到的是"双击一闪而过"。DX12 才是 Windows
+/// 上的首选后端，GL 兜底（两者实测都能出窗口）。`WGPU_BACKEND` 永远优先，
+/// 纯 Vulkan 的机器 `set WGPU_BACKEND=vulkan` 还能用回来（见 README）。
+fn preferred_backends(windows: bool) -> Option<wgpu::Backends> {
+    if !windows {
+        return None;
+    }
+    Some(wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::GL))
+}
+
+/// 把候选后端写进 eframe 的配置。单独拎出来是为了能测（见文件末尾）：
+/// 光算对候选没用，得确认它真的落到了 eframe 建 instance 时读的那份配置上。
+fn set_backends(options: &mut eframe::NativeOptions, backends: Option<wgpu::Backends>) {
+    // 无论哪条路径都在 info 上留一句"这次给 wgpu 的是什么后端"：默认级别下就看得见，
+    // 不用为了这一句去开 debug（挑中哪个适配器仍然是 wgpu 的 debug 输出）
+    let Some(backends) = backends else {
+        log::info!("wgpu 候选后端：wgpu 默认（PRIMARY | GL）");
+        return;
+    };
+    match &mut options.wgpu_options.wgpu_setup {
+        eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+            log::info!("wgpu 候选后端：{backends:?}");
+            setup.instance_descriptor.backends = backends;
+        }
+        // 到不了这儿：eframe 默认就是 CreateNew。真到了说明上游改了默认值，
+        // 我们的后端偏好没生效——留条日志，别又变成一次静默失败
+        other => log::warn!("wgpu_setup 不是 CreateNew（{other:?}），后端候选没设上"),
+    }
+}
+
 fn run() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 560.0])
             .with_resizable(false),
         ..Default::default()
     };
+    set_backends(&mut options, preferred_backends(cfg!(windows)));
     eframe::run_native(
         "VZip",
         options,
@@ -701,5 +741,48 @@ mod log_tests {
         assert!(!text.contains("这条不该出现"), "实际内容：{text}");
         assert!(text.contains("这条该出现"), "实际内容：{text}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+/// 后端候选是这次修 Windows 起不来的关键，守两条：默认里没有 Vulkan、`WGPU_BACKEND` 优先。
+/// 参数化平台而不是 `cfg!`，这样 Linux 上跑 `cargo test` 也能校验 Windows 那条分支。
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn windows_default_backends_exclude_vulkan() {
+        assert_eq!(
+            preferred_backends(false),
+            None,
+            "非 Windows 不该覆盖 wgpu 默认"
+        );
+
+        let win = preferred_backends(true).expect("Windows 上必须给一组候选后端");
+        if let Some(env) = wgpu::Backends::from_env() {
+            assert_eq!(win, env, "WGPU_BACKEND 是用户的逃生舱，必须优先");
+        } else {
+            assert_eq!(
+                win,
+                wgpu::Backends::DX12 | wgpu::Backends::GL,
+                "Windows 默认候选必须正好是 DX12 + GL（不含 Vulkan）"
+            );
+        }
+    }
+
+    /// 候选算对了还得真的写进 eframe 那份配置——否则等于没改。
+    /// 这条只在 Linux 上构造 `NativeOptions`（不开窗口、不碰显卡），所以 CI 里也能跑。
+    #[test]
+    fn backends_reach_the_eframe_config() {
+        let want = wgpu::Backends::DX12 | wgpu::Backends::GL;
+        let mut options = eframe::NativeOptions::default();
+        set_backends(&mut options, Some(want));
+
+        match &options.wgpu_options.wgpu_setup {
+            eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+                assert_eq!(setup.instance_descriptor.backends, want);
+            }
+            other => panic!("eframe 默认应给出 CreateNew，实际 {other:?}"),
+        }
     }
 }
