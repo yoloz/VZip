@@ -24,6 +24,9 @@ VZip：给小孩朗读视频打卡用的视频压缩工具。手机拍的朗读�
 - 分发靠 GitHub Actions（`.github/workflows/`）：推 `v*` tag 出四平台包，
   每平台自带 ffmpeg（eugeneware/ffmpeg-static，GPL，见 `NOTICE.txt`），
   打包前后都有校验 + 冒烟测试，坏包不发
+- CI 里的 action 都跑在 **node24**（checkout v7 / upload-artifact v7 /
+  action-gh-release v3 / rust-cache v2），GitHub 托管 runner 没问题；
+  将来若换自托管 runner 得 ≥ 2.329.0，否则会退回旧运行时
 - Linux 上编 egui 要 `libwayland-dev`（winit 的 wayland 后端走 client_system，
   只装 libxkbcommon 会在链接期失败）+ `libxkbcommon-dev`、`libegl1-mesa-dev`、`libgl1-mesa-dev`
 

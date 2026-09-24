@@ -44,7 +44,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -133,14 +133,14 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path dist\* -DestinationPath ${{ matrix.pkg }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.pkg }}
           path: ${{ matrix.pkg }}.*
 
       - name: 上传 Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.pkg }}.*
           generate_release_notes: true
