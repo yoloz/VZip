@@ -64,22 +64,26 @@ jobs:
       - name: 编译
         run: cargo build --release --bins --target ${{ matrix.target }}
 
+      # 直接下成最终文件名：Linux/macOS 无后缀，Windows 是 .exe。
+      # 别写成先下成 dist/ffmpeg 再 `mv` 改后缀——Linux/macOS 的 matrix 项没有
+      # ext，展开是空串，就成了同名 mv：GNU mv 会报 "are the same file" 退出 1
+      # （BSD mv 不报，所以这种写法只有 Linux 会挂）
       - name: 下载 ffmpeg / ffprobe
         shell: bash
         run: |
           mkdir -p dist
           curl -fL --retry 3 --retry-delay 2 \
-            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffmpeg_asset }}" -o dist/ffmpeg
+            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffmpeg_asset }}" \
+            -o "dist/ffmpeg${{ matrix.ext }}"
           curl -fL --retry 3 --retry-delay 2 \
-            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffprobe_asset }}" -o dist/ffprobe
+            "$BASE_URL/$FFMPEG_TAG/${{ matrix.ffprobe_asset }}" \
+            -o "dist/ffprobe${{ matrix.ext }}"
 
       - name: 归置产物
         shell: bash
         run: |
           cp "target/${{ matrix.target }}/release/vzip${{ matrix.ext }}"     dist/
           cp "target/${{ matrix.target }}/release/vzip-gui${{ matrix.ext }}" dist/
-          mv dist/ffmpeg  "dist/ffmpeg${{ matrix.ext }}"
-          mv dist/ffprobe "dist/ffprobe${{ matrix.ext }}"
           chmod +x dist/*
           cp NOTICE.txt dist/
 
