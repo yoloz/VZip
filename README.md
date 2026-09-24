@@ -26,6 +26,8 @@
 
 Linux 的图形界面要系统有 OpenGL + xkbcommon + wayland/X11，文件选择框走 xdg-desktop-portal（GNOME / KDE 默认都有）；命令行版没这些要求。
 
+**界面打不开怎么办**：图形界面用 wgpu 渲染，需要能用的显卡驱动（虚拟机上要开 3D 加速，否则可能起不来）。启动失败时会弹一个错误框，同时在程序同目录留下 `vzip-gui.log`，里面有详细原因；把它发出来即可。想看得更细，可以先 `set VZIP_LOG=trace`（Linux/macOS 用 `export`）再运行。
+
 ## 从源码构建
 
 ```bash

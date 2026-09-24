@@ -1,7 +1,13 @@
+// 打包出去给用户双击的是 release 版：不加这行，Windows 上双击会先弹一个黑色 cmd
+// 窗口。错误不再靠控制台看，改由 logger 落到 vzip-gui.log + 弹窗（见文件末尾）。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use vzip::encode::{FlagSink, Progress};
@@ -470,20 +476,6 @@ fn default_output(input: &Path) -> PathBuf {
     dir.join(format!("{}_vzip.mp4", stem))
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    /// Linux 上 winit 的 system_theme() 恒为 None（winit 0.30 platform_impl/linux/mod.rs:909），
-    /// egui 便落到 fallback_theme。不能留 egui 默认的暗色，否则浅色桌面每次打开都是黑的。
-    #[test]
-    fn linux_falls_back_to_light_theme() {
-        let ctx = egui::Context::default();
-        let _app = App::new(&ctx);
-        assert_eq!(ctx.theme(), egui::Theme::Light, "Linux 兜底主题应为亮色");
-    }
-}
-
 fn open_in_file_manager(path: &Path) {
     let dir = path.parent().unwrap_or(Path::new("."));
     let _ = if cfg!(target_os = "windows") {
@@ -495,7 +487,130 @@ fn open_in_file_manager(path: &Path) {
     };
 }
 
-fn main() -> eframe::Result<()> {
+// ------------------------------------------------------------ 日志 / 启动失败
+
+/// 自己装 logger，因为 GUI 的启动失败否则会**完全静默**：
+/// eframe 把错误只写进 `log::error!`（见 eframe `native/run.rs`），没装 logger
+/// 就等于丢进黑洞，而双击运行的 GUI 连控制台都一闪而过——用户只看到"打不开"。
+/// 所以落到 exe 同目录的 `vzip-gui.log`（每次运行覆盖，留的就是最近一次），
+/// 同时镜像一份到 stderr，终端里跑的时候能直接看。
+struct FileLogger {
+    level: log::LevelFilter,
+    file: Mutex<Option<File>>,
+}
+
+impl FileLogger {
+    fn new(level: log::LevelFilter, file: Option<File>) -> Self {
+        Self {
+            level,
+            file: Mutex::new(file),
+        }
+    }
+
+    /// 先落盘、再尽力镜像到 stderr。用 `write_all` 而不是 `eprint!`：
+    /// GUI 子系统下 stderr 可能是个无效句柄，`eprint!` 写失败会 panic——
+    /// 错误路径上不能再炸一次。
+    fn write_line(&self, line: &str) {
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= self.level
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.write_line(&format!(
+                "{:<5} {} — {}\n",
+                record.level(),
+                record.target(),
+                record.args()
+            ));
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+/// 日志落哪：优先 exe 同目录（解压即用的分发包里就是解压目录），
+/// 退到当前目录，再退到临时目录；都写不进去就只留 stderr。
+fn open_log_file() -> Option<(PathBuf, File)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("vzip-gui.log"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("vzip-gui.log"));
+    }
+    candidates.push(std::env::temp_dir().join("vzip-gui.log"));
+
+    candidates
+        .into_iter()
+        .find_map(|path| File::create(&path).ok().map(|file| (path, file)))
+}
+
+/// 级别用 `VZIP_LOG` 覆盖（`info` / `trace` / `off`…），默认 debug：
+/// 启动阶段就这么点输出，写全一点才够排查。
+fn init_logging() -> Option<PathBuf> {
+    let level = std::env::var("VZIP_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(log::LevelFilter::Debug);
+
+    let opened = open_log_file();
+    let path = opened.as_ref().map(|(path, _)| path.clone());
+    let logger = FileLogger::new(level, opened.map(|(_, file)| file));
+    if log::set_boxed_logger(Box::new(logger)).is_ok() {
+        log::set_max_level(level);
+    }
+    path
+}
+
+/// 启动失败时弹个框：双击运行的场景下这是唯一看得见错误的地方。
+/// 弹不出来（比如 Linux 上没装 zenity）也没关系——日志已经落盘了。
+fn show_startup_error(message: &str, log_path: Option<&Path>) {
+    let mut text = format!("VZip 启动失败：\n\n{message}");
+    if let Some(path) = log_path {
+        text.push_str(&format!("\n\n详细日志：{}", path.display()));
+    }
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("VZip 启动失败")
+        .set_description(text)
+        .show();
+}
+
+fn main() {
+    let log_path = init_logging();
+    log::info!(
+        "vzip-gui {} 启动（exe={:?} 日志={:?}）",
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe().ok(),
+        log_path
+    );
+
+    if let Err(err) = run() {
+        log::error!("启动失败：{err}");
+        show_startup_error(&err.to_string(), log_path.as_deref());
+    }
+}
+
+fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 560.0])
@@ -510,4 +625,81 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// Linux 上 winit 的 system_theme() 恒为 None（winit 0.30 platform_impl/linux/mod.rs:909），
+    /// egui 便落到 fallback_theme。不能留 egui 默认的暗色，否则浅色桌面每次打开都是黑的。
+    #[test]
+    fn linux_falls_back_to_light_theme() {
+        let ctx = egui::Context::default();
+        let _app = App::new(&ctx);
+        assert_eq!(ctx.theme(), egui::Theme::Light, "Linux 兜底主题应为亮色");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use log::Log as _; // 调 FileLogger::log 需要 trait 在作用域里
+
+    fn logger_at(dir_tag: &str, level: log::LevelFilter) -> (PathBuf, FileLogger) {
+        let dir = std::env::temp_dir().join(format!("vzip-gui-{dir_tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vzip-gui.log");
+        let logger = FileLogger::new(level, Some(File::create(&path).unwrap()));
+        (path, logger)
+    }
+
+    /// 这次改动的核心：eframe 的启动错误必须落进文件。
+    /// 下面这句就是 eframe `native/run.rs` 里唯一的错误出口。
+    #[test]
+    fn eframe_startup_error_reaches_the_log_file() {
+        let (path, logger) = logger_at("err", log::LevelFilter::Debug);
+
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("eframe::native::run")
+                .args(format_args!(
+                    "Exiting because of error: 没有可用的图形适配器"
+                ))
+                .build(),
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("没有可用的图形适配器"), "实际内容：{text}");
+        assert!(text.contains("eframe::native::run"), "实际内容：{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `VZIP_LOG` 能压级别：排查完就不用再往文件里写噪音。
+    #[test]
+    fn level_filter_is_respected() {
+        let (path, logger) = logger_at("level", log::LevelFilter::Info);
+
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Trace)
+                .target("wgpu_core")
+                .args(format_args!("这条不该出现"))
+                .build(),
+        );
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Warn)
+                .target("wgpu_core")
+                .args(format_args!("这条该出现"))
+                .build(),
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("这条不该出现"), "实际内容：{text}");
+        assert!(text.contains("这条该出现"), "实际内容：{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

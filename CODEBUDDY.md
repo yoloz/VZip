@@ -8,7 +8,7 @@ VZip：给小孩朗读视频打卡用的视频压缩工具。手机拍的朗读�
 
 - 编解码一律复用 ffmpeg，不自研
 - 调 ffmpeg 走**子进程 CLI**，执行层抽象成 trait（将来可换 FFI）
-- 依赖：`anyhow` / `clap` / `serde_json` / `ctrlc` / `eframe` / `egui-chinese-font` / `rfd`
+- 依赖：`anyhow` / `clap` / `serde_json` / `ctrlc` / `eframe` / `egui-chinese-font` / `log` / `rfd`
 - 两个 bin：`vzip`（CLI）和 `vzip-gui`（egui）
 - 内存只有 6G，编 eframe 依赖树要用 `cargo build -j 2`，否则会 OOM 重启
 - 子进程参数用 `Command` 参数数组，不拼 shell 字符串（中文、空格路径必须正常）
@@ -18,6 +18,11 @@ VZip：给小孩朗读视频打卡用的视频压缩工具。手机拍的朗读�
 - 主题：egui 默认「跟随系统」，Windows / macOS 由 winit 上报；但 **winit 在 Linux 上
   不上报**（`system_theme()` 恒为 None），egui 会落到 `fallback_theme`（默认暗色，
   浅色桌面打开就是黑的）→ `App::new` 里只在 Linux 把兜底改成亮色。别删这段
+- GUI 的启动失败**必须看得见**：eframe 把错误只写进 `log::error!`
+  （`eframe/src/native/run.rs`），没装 logger 就等于静默退出，双击的用户只看到
+  "一闪而过"。所以 `vzip-gui` 自己装 logger 写到 exe 同目录 `vzip-gui.log`
+  （`VZIP_LOG=info|trace|off` 调级别，默认 debug），失败再弹 `rfd` 消息框；
+  release 版还带 `windows_subsystem = "windows"`，双击不再弹黑窗。别删这段
 - 若将来要在界面里内嵌播放视频 → 换 Tauri 2（egui 做不到）
 - ffmpeg 查找顺序：`--ffmpeg` > `VZIP_FFMPEG` > **exe 同目录（分发自带）** > PATH。
   自带必须优先，否则分发包会被系统旧 ffmpeg 顶掉再卡版本检查
